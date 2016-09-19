@@ -13,9 +13,11 @@
 #include <botan/loadstor.h>
 #include <botan/internal/tls_seq_numbers.h>
 #include <botan/internal/tls_session_key.h>
+#include <botan/internal/tls_cbc.h>
 #include <botan/internal/rounding.h>
 #include <botan/internal/ct_utils.h>
 #include <botan/rng.h>
+#include <botan/hex.h>
 
 namespace Botan {
 
@@ -48,15 +50,17 @@ Connection_Cipher_State::Connection_Cipher_State(Protocol_Version version,
       mac_key = keys.server_mac_key();
       }
 
+   BOTAN_ASSERT_EQUAL(iv.length(), nonce_bytes_from_handshake(), "Matching nonce sizes");
+
    const std::string cipher_algo = suite.cipher_algo();
    const std::string mac_algo = suite.mac_algo();
 
    if(AEAD_Mode* aead = get_aead(cipher_algo, our_side ? ENCRYPTION : DECRYPTION))
       {
+      m_cbc_nonce = false;
       m_aead.reset(aead);
       m_aead->set_key(cipher_key + mac_key);
 
-      BOTAN_ASSERT_EQUAL(iv.length(), nonce_bytes_from_handshake(), "Matching nonce sizes");
       m_nonce = unlock(iv.bits_of());
 
       BOTAN_ASSERT(nonce_bytes_from_record() == 0 || nonce_bytes_from_record() == 8,
@@ -68,6 +72,28 @@ Connection_Cipher_State::Connection_Cipher_State(Protocol_Version version,
          }
 
       return;
+      }
+
+   m_cbc_nonce = true;
+
+   if(our_side)
+      {
+      m_aead.reset(new TLS_CBC_HMAC_AEAD_Encryption(
+                      cipher_algo,
+                      suite.cipher_keylen(),
+                      mac_algo,
+                      suite.mac_keylen(),
+                      version.supports_explicit_cbc_ivs(),
+                      uses_encrypt_then_mac));
+
+      m_aead->set_key(cipher_key + mac_key);
+
+      m_nonce = unlock(iv.bits_of());
+
+      m_aead->start(iv.bits_of());
+
+      if(version.supports_explicit_cbc_ivs())
+         m_nonce_bytes_from_record = m_nonce_bytes_from_handshake;
       }
 
    m_block_cipher = BlockCipher::create(cipher_algo);
@@ -85,9 +111,22 @@ Connection_Cipher_State::Connection_Cipher_State(Protocol_Version version,
    m_mac->set_key(mac_key);
    }
 
-std::vector<byte> Connection_Cipher_State::aead_nonce(u64bit seq)
+std::vector<byte> Connection_Cipher_State::aead_nonce(u64bit seq, RandomNumberGenerator& rng)
    {
-   if(nonce_bytes_from_handshake() == 12)
+   if(m_cbc_nonce)
+      {
+      if(m_nonce.size())
+         {
+         std::vector<byte> nonce;
+         nonce.swap(m_nonce);
+         return nonce;
+         }
+      std::vector<byte> nonce(nonce_bytes_from_record());
+      rng.randomize(nonce.data(), nonce.size());
+      printf("nonce_bytes_from_record = %d\n", nonce_bytes_from_record());
+      return nonce;
+      }
+   else if(nonce_bytes_from_handshake() == 12)
       {
       std::vector<byte> nonce(12);
       store_be(seq, nonce.data() + 4);
@@ -223,7 +262,7 @@ void write_record(secure_vector<byte>& output,
       {
       const size_t ctext_size = aead->output_length(msg.get_size());
 
-      const std::vector<byte> nonce = cs->aead_nonce(seq);
+      const std::vector<byte> nonce = cs->aead_nonce(seq, rng);
 
       const size_t rec_size = ctext_size + cs->nonce_bytes_from_record();
 
@@ -232,14 +271,22 @@ void write_record(secure_vector<byte>& output,
 
       aead->set_ad(aad);
 
-      if(cs->nonce_bytes_from_record() > 0)
+      if(cs->cbc_nonce())
+         {
+         output += nonce;
+         }
+      else if(cs->nonce_bytes_from_record() > 0)
          {
          output += std::make_pair(&nonce[cs->nonce_bytes_from_handshake()], cs->nonce_bytes_from_record());
          }
+
       const size_t header_size = output.size();
       output += std::make_pair(msg.get_data(), msg.get_size());
 
+      printf("nonce = '%s'\n", hex_encode(nonce).c_str());
+      printf("nonce %d\n", nonce.size());
       aead->start(nonce);
+      printf("nonce %d ok\n", nonce.size());
       aead->finish(output, header_size);
 
       BOTAN_ASSERT(output.size() < MAX_CIPHERTEXT_SIZE,
@@ -435,7 +482,7 @@ void decrypt_record(secure_vector<byte>& output,
          {
          // This early exit does not leak info because all the values are public
          if((record_len < mac_size + iv_size) || (record_len % cs.block_size() != 0))
-            throw TLS_Exception(Alert::BAD_RECORD_MAC, "Message authentication failure");
+            throw TLS_Exception(Alert::BAD_RECORD_MAC, "Message authentication failure (bogus ciphertext)");
 
          CT::poison(record_contents, record_len);
 
@@ -461,7 +508,8 @@ void decrypt_record(secure_vector<byte>& output,
          const byte* plaintext_block = &record_contents[iv_size];
          const u16bit plaintext_length = static_cast<u16bit>(record_len - mac_size - iv_size - pad_size);
 
-         cs.mac()->update(cs.format_ad(record_sequence, record_type, record_version, plaintext_length));
+         const std::vector<uint8_t> ad = cs.format_ad(record_sequence, record_type, record_version, plaintext_length);
+         cs.mac()->update(ad);
          cs.mac()->update(plaintext_block, plaintext_length);
 
          std::vector<byte> mac_buf(mac_size);
@@ -470,6 +518,13 @@ void decrypt_record(secure_vector<byte>& output,
          const size_t mac_offset = record_len - (mac_size + pad_size);
 
          const bool mac_ok = same_mem(&record_contents[mac_offset], mac_buf.data(), mac_size);
+
+         printf("MAC AD=%s PT=%s -> %s vs %s (MtE OK %d)\n", Botan::hex_encode(ad).c_str(),
+                Botan::hex_encode(plaintext_block, plaintext_length).c_str(),
+                Botan::hex_encode(mac_buf).c_str(),
+                Botan::hex_encode(&record_contents[mac_offset], mac_size).c_str(),
+                mac_ok);
+
 
          const u16bit ok_mask = size_ok_mask & CT::expand_mask<u16bit>(mac_ok) & CT::expand_mask<u16bit>(pad_size);
 
@@ -481,7 +536,8 @@ void decrypt_record(secure_vector<byte>& output,
             }
          else
             {
-            throw TLS_Exception(Alert::BAD_RECORD_MAC, "Message authentication failure");
+            printf("MtE failed: mac=%d pad=%d\n", mac_ok, pad_size);
+            throw TLS_Exception(Alert::BAD_RECORD_MAC, "Message authentication failure (bad mac?)");
             }
          }
       else
@@ -491,7 +547,8 @@ void decrypt_record(secure_vector<byte>& output,
          if((record_len < mac_size + iv_size) || ( enc_size % cs.block_size() != 0))
             throw TLS_Exception(Alert::BAD_RECORD_MAC, "Message authentication failure");
 
-         cs.mac()->update(cs.format_ad(record_sequence, record_type, record_version, enc_size));
+         const std::vector<uint8_t> ad = cs.format_ad(record_sequence, record_type, record_version, enc_size);
+         cs.mac()->update(ad);
          cs.mac()->update(record_contents, enc_size);
 
          std::vector<byte> mac_buf(mac_size);
@@ -500,6 +557,12 @@ void decrypt_record(secure_vector<byte>& output,
          const size_t mac_offset = enc_size;
 
          const bool mac_ok = same_mem(&record_contents[mac_offset], mac_buf.data(), mac_size);
+
+         printf("MAC AD=%s CT=%s -> %s vs %s (EtM OK %d)\n", Botan::hex_encode(ad).c_str(),
+                Botan::hex_encode(record_contents, enc_size).c_str(),
+                Botan::hex_encode(mac_buf).c_str(),
+                Botan::hex_encode(&record_contents[mac_offset], mac_size).c_str(),
+                mac_ok);
 
          if(!mac_ok)
             {

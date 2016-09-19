@@ -44,13 +44,15 @@ class Connection_Cipher_State
 
       AEAD_Mode* aead() { return m_aead.get(); }
 
-      std::vector<byte> aead_nonce(u64bit seq);
+      std::vector<byte> aead_nonce(u64bit seq, RandomNumberGenerator& rng);
 
       std::vector<byte> aead_nonce(const byte record[], size_t record_len, u64bit seq);
 
       std::vector<byte> format_ad(u64bit seq, byte type,
                                   Protocol_Version version,
                                   u16bit ptext_length);
+
+      bool cbc_nonce() const { return m_cbc_nonce; }
 
       BlockCipher* block_cipher() { return m_block_cipher.get(); }
 
@@ -87,6 +89,7 @@ class Connection_Cipher_State
 
       std::unique_ptr<AEAD_Mode> m_aead;
       std::vector<byte> m_nonce;
+      bool m_cbc_nonce;
 
       size_t m_block_size = 0;
       size_t m_nonce_bytes_from_handshake;
